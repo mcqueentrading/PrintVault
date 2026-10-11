@@ -1020,12 +1020,19 @@ function pvWorkerMain(){
   /* ---- OBJ ---- */
   function parseOBJ(text, maxTri){
     const verts=[], out=[];
+    /* Most slicer-exported and AI-generated OBJ meshes are triangulated, so
+       this gives us a cheap sampling step before we allocate the output. The
+       exact triangle count is still tracked below for display. */
+    const faceLines = maxTri ? ((text.match(/\nf\s/g) || []).length + (/^f\s/.test(text) ? 1 : 0)) : 0;
+    const step = maxTri && faceLines > maxTri ? Math.ceil(faceLines / maxTri) : 1;
+    let faceNo = 0, tris = 0;
     const lines = text.split(/\r?\n/);
     for(let i=0;i<lines.length;i++){
       const L = lines[i];
       if(L.charCodeAt(0)===118 && L.charCodeAt(1)===32){ // "v "
         const p = L.split(/\s+/); verts.push(+p[1], +p[2], +p[3]);
       } else if(L.charCodeAt(0)===102 && L.charCodeAt(1)===32){ // "f "
+        const thisFace = faceNo++;
         const p = L.trim().split(/\s+/), idx=[];
         for(let j=1;j<p.length;j++){
           let k = parseInt(p[j], 10);
@@ -1033,18 +1040,14 @@ function pvWorkerMain(){
           if(k<0) k = verts.length/3 + k; else k -= 1;
           idx.push(k);
         }
+        tris += Math.max(0, idx.length - 2);
+        if(thisFace % step) continue;
         for(let j=1;j+1<idx.length;j++){
           [idx[0], idx[j], idx[j+1]].forEach(k=>{ out.push(verts[k*3], verts[k*3+1], verts[k*3+2]); });
         }
       }
     }
     let pos = new Float32Array(out);
-    const tris = Math.floor(pos.length/9);
-    if(maxTri && tris>maxTri){
-      const step=Math.ceil(tris/maxTri), o2=new Float32Array(Math.ceil(tris/step)*9);
-      let w=0; for(let t=0;t<tris;t+=step){ o2.set(pos.subarray(t*9,t*9+9), w); w+=9; }
-      pos = o2.subarray(0,w);
-    }
     return {pos, nrm: flatNormals(pos), tris};
   }
 
@@ -2659,7 +2662,9 @@ const Scan = {
       m.fileCount = list.length;
       m.bytes = list.reduce((s,f)=>s+(f.size||0), 0);
       m.meshCount = list.filter(f=>f.kind==='mesh').length;
+      m.cadCount = list.filter(f=>f.kind==='cad').length;
       m.gcodeCount = list.filter(f=>f.kind==='gcode').length;
+      m.slicedOnly = !!m.gcodeCount && !m.meshCount && !m.cadCount && !m.isArchive;
       m.imgCount = list.filter(f=>f.kind==='image').length;
       m.mtime = list.reduce((s,f)=>Math.max(s, f.mtime||0), 0);
       m.est = best ? {timeMin:best.timeMin||null, grams:best.grams||null, material:best.material||null,
@@ -2977,9 +2982,10 @@ const UI = {
     const printed = new Set(Store.prints.map(p=>p.modelId));
     const q = {
       fav: models.filter(m=>m.favorite).length,
-      unprinted: models.filter(m=>!printed.has(m.id)).length,
-      printed: models.filter(m=>printed.has(m.id)).length,
-      gcode: models.filter(m=>m.gcodeCount > 0).length,
+      model: models.filter(m=>!m.slicedOnly).length,
+      unprinted: models.filter(m=>!m.slicedOnly && !printed.has(m.id)).length,
+      printed: models.filter(m=>!m.slicedOnly && printed.has(m.id)).length,
+      gcode: models.filter(m=>m.slicedOnly || m.gcodeCount > 0).length,
       untagged: models.filter(m=>!(m.tags||[]).length).length,
       nothumb: models.filter(m=>!m.thumbId).length,
       arch: models.filter(m=>m.isArchive).length
@@ -2990,11 +2996,11 @@ const UI = {
 
     let h = '<div class="pv-sg">'+
       '<div class="pv-sh">Library</div>'+
-      item(!f.quick && !f.rootId && !f.tag && !f.coll, 'cube', 'All models', models.length, "PV.Library.filter('reset')")+
+      item(!f.quick && !f.rootId && !f.tag && !f.coll, 'cube', 'Models', q.model, "PV.Library.filter('reset')")+
       item(f.quick==='fav', 'star', 'Favorites', q.fav, "PV.Library.filter('quick','fav')")+
       item(f.quick==='unprinted', 'clock', 'Never printed', q.unprinted, "PV.Library.filter('quick','unprinted')")+
       item(f.quick==='printed', 'check', 'Printed', q.printed, "PV.Library.filter('quick','printed')")+
-      item(f.quick==='gcode', 'print', 'Sliced (gcode)', q.gcode, "PV.Library.filter('quick','gcode')")+
+      item(f.quick==='gcode', 'print', 'G-code jobs', q.gcode, "PV.Library.filter('quick','gcode')")+
       (q.arch ? item(f.quick==='arch', 'copy', 'Archives', q.arch, "PV.Library.filter('quick','arch')") : '')+
       item(f.quick==='untagged', 'tag', 'Untagged', q.untagged, "PV.Library.filter('quick','untagged')")+
       item(f.quick==='nothumb', 'img', 'No preview', q.nothumb, "PV.Library.filter('quick','nothumb')")+
@@ -3061,6 +3067,8 @@ const Library = {
       if(f.quick==='arch' && !m.isArchive) return false;
       if(f.quick==='untagged' && (m.tags||[]).length) return false;
       if(f.quick==='nothumb' && m.thumbId) return false;
+      if(!f.quick && m.slicedOnly) return false;
+      if((f.quick==='fav' || f.quick==='unprinted' || f.quick==='printed' || f.quick==='untagged' || f.quick==='nothumb') && m.slicedOnly) return false;
       if(toks.length){
         const hay = m.name+' '+m.path+' '+(m.tags||[]).join(' ')+' '+(m.collections||[]).join(' ')+' '+
                     (m.creator||'')+' '+(m.notes||'')+' '+(m.source||'')+' '+((m.inner||[]).join(' '));
@@ -3097,8 +3105,8 @@ const Library = {
 
     let h = '<div class="pv-bar'+(Library.sel.size?' stick':'')+'">'+
       '<button class="b g ico" onclick="PV.Library.toggleSide()" title="Toggle sidebar">'+I.menu+'</button>'+
-      '<h2>'+(f.tag ? U.esc(f.tag) : f.coll ? U.esc(f.coll) : f.rootId ? U.esc((Store.root(f.rootId)||{}).name) : 'All Models')+'</h2>'+
-      '<span class="cnt">'+all.length.toLocaleString()+(all.length===1?' model':' models')+'</span>'+
+      '<h2>'+(f.quick==='gcode' ? 'G-code Jobs' : f.tag ? U.esc(f.tag) : f.coll ? U.esc(f.coll) : f.rootId ? U.esc((Store.root(f.rootId)||{}).name) : 'Models')+'</h2>'+
+      '<span class="cnt">'+all.length.toLocaleString()+(f.quick==='gcode' ? (all.length===1?' job':' jobs') : (all.length===1?' model':' models'))+'</span>'+
       '<div class="sp"></div>'+
       /* Someone who reads carefully and files good bug reports still did not
          know several models could be selected at once, because nothing has
@@ -3174,7 +3182,8 @@ const Library = {
     let badges = '';
     if(m.isArchive) badges += '<span class="bdg">'+U.esc(m.archiveExt||'zip')+
       (m.innerCount ? ' &middot; '+m.innerCount+' inside' : ' &middot; not extracted')+'</span>';
-    if(m.gcodeCount) badges += '<span class="bdg acc">'+m.gcodeCount+' gcode</span>';
+    if(m.slicedOnly) badges += '<span class="bdg acc">gcode job</span>';
+    else if(m.gcodeCount) badges += '<span class="bdg acc">'+m.gcodeCount+' gcode</span>';
     if(p.length) badges += '<span class="bdg ok">printed '+p.length+'&times;</span>';
     const tags = (m.tags||[]).slice(0,3).map(t=>'<span class="tg">'+U.esc(t)+'</span>').join('')+
                  ((m.tags||[]).length>3 ? '<span class="tg">+'+((m.tags||[]).length-3)+'</span>' : '');
@@ -4223,7 +4232,11 @@ const Viewer = {
       '<div class="spin" style="margin:0 auto 10px"></div>Loading '+U.esc(item.name)+'...</div>';
     try{
       const {buf, ext, size} = await Viewer.bytesFor(item);
-      const out = await Work.call({op:'mesh', buf, ext, maxTri:900000, needMesh:true}, [buf]);
+      // OBJ files from photogrammetry/AI generators are often multi-million
+      // triangle text files. Keep the interactive viewer responsive; the
+      // original file stays untouched and can still be sent/shared.
+      const maxTri = ext === 'obj' && size > 80e6 ? 350000 : 900000;
+      const out = await Work.call({op:'mesh', buf, ext, maxTri, needMesh:true}, [buf]);
       if(!out.pos || !out.pos.length) throw new Error('No mesh geometry found in this file');
       Viewer.data = {pos:out.pos, nrm:out.nrm, bbox:out.bbox, tris:out.tris, col:out.col,
         file:{id:item.fileId, modelId:item.modelId, name:item.name, size:size}};
