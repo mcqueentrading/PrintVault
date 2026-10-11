@@ -2232,7 +2232,8 @@ const Scan = {
   modelPathFor(filePath, ctx){
     const dir = U.dir(filePath);
     if(!dir) return {path:filePath, loose:true};
-    const cat = ctx && ctx.cat, merge = ctx && ctx.merge;
+    const cat = ctx && ctx.cat, merge = ctx && ctx.merge, leaf = ctx && ctx.leaf;
+    if(leaf && leaf.has(dir)) return {path:dir, loose:false};
     if(cat && cat.has(dir)) return {path:filePath, loose:true};
     const segs = dir.split('/');
     let i = segs.length - 1;
@@ -2283,7 +2284,7 @@ const Scan = {
       stems.get(d).add(U.stem(f.name).toLowerCase());
     });
 
-    const cat = new Set(), merge = new Set();
+    const cat = new Set(), merge = new Set(), leaf = new Set();
     subs.forEach((list, parent)=>{
       const near = stems.get(parent);
       // a subfolder named like a file beside it is that file unpacked, so it
@@ -2295,7 +2296,25 @@ const Scan = {
       // so anything loose beside them is its own model
       if(rest >= 2 || (rest === 1 && !twins.length)) cat.add(parent);
     });
-    return {dirs, cat, merge};
+    /* A library commonly looks like:
+         root/category/model_name/model.obj
+       or, after downloads have been unpacked:
+         root/sorted_textured_uv_models/model_name/model.obj
+
+       The older grouping code usually handled this, but it could still collapse
+       a nested library into a parent folder when the parent was not detected as
+       a category. Force any printable directory with no printable child model
+       directories to be a model boundary. Wrapper folders such as `files/` and
+       `stl/` are intentionally excluded so `model/files/part.stl` still groups
+       under `model`.
+    */
+    printable.forEach(d=>{
+      if(!d) return;
+      if(GENERIC_DIRS.has(U.base(d).toLowerCase())) return;
+      const hasPrintableChild = Array.from(printable).some(x=>x && x !== d && U.dir(x) === d);
+      if(!hasPrintableChild) leaf.add(d);
+    });
+    return {dirs, cat, merge, leaf};
   },
 
   async run(rootIds){
